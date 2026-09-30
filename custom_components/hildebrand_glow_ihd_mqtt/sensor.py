@@ -1,6 +1,7 @@
 """Support for hildebrand glow MQTT sensors."""
 
 from __future__ import annotations
+from dataclasses import asdict, dataclass
 from datetime import datetime, time, timedelta, tzinfo
 import json
 import logging
@@ -25,6 +26,7 @@ from homeassistant.const import (
 )
 from homeassistant.core import callback
 from homeassistant.helpers.entity import DeviceInfo, EntityCategory
+from homeassistant.helpers.restore_state import ExtraStoredData, RestoreEntity
 from homeassistant.util import slugify
 
 from .const import (
@@ -99,6 +101,17 @@ ELECTRICITY_SENSORS = [
         "state_class": SensorStateClass.TOTAL_INCREASING,
         "icon": "mdi:flash",
         "func": lambda js: js["electricitymeter"]["energy"]["export"]["cumulative"],
+    },
+    {
+        # The IHD doesn't publish a daily export figure, so derive it from the cumulative reading
+        "name": "Smart Meter Electricity: Export (Today)",
+        "device_class": SensorDeviceClass.ENERGY,
+        "unit_of_measurement": UnitOfEnergy.KILO_WATT_HOUR,
+        "state_class": SensorStateClass.TOTAL,
+        "icon": "mdi:flash",
+        "meter_interval": MeterInterval.DAY,
+        "func": lambda js: js["electricitymeter"]["energy"]["export"]["cumulative"],
+        "daily_from_cumulative": True,
     },
     {
         "name": "Smart Meter Electricity: Import",
@@ -378,9 +391,17 @@ class HildebrandGlowMqttSensorUpdateGroup:
         """Initialize the sensor collection."""
         self._topic_regex = re.compile(topic_regex)
         self._sensors = [
-            HildebrandGlowMqttSensor(device_id=device_id, time_zone=time_zone, **meter)
-            for meter in meters
+            self._create_sensor(device_id, time_zone, dict(meter)) for meter in meters
         ]
+
+    @staticmethod
+    def _create_sensor(device_id: str, time_zone: str | None, meter: dict):
+        """Create the right sensor type for a meter definition."""
+        if meter.pop("daily_from_cumulative", False):
+            return HildebrandGlowMqttDailyTotalSensor(
+                device_id=device_id, time_zone=time_zone, **meter
+            )
+        return HildebrandGlowMqttSensor(device_id=device_id, time_zone=time_zone, **meter)
 
     def process_update(self, message: ReceiveMessage) -> None:
         """Process an update from the MQTT broker."""
@@ -517,3 +538,104 @@ class HildebrandGlowMqttSensor(SensorEntity):
     def extra_state_attributes(self):
         """Return the state attributes."""
         return {ATTR_DEVICE_ID: self._device_id}
+
+
+@dataclass
+class DailyTotalStoredData(ExtraStoredData):
+    """Data persisted across restarts for a daily total sensor."""
+
+    baseline: float | None
+    baseline_day: str | None
+    last_cumulative: float | None
+
+    def as_dict(self) -> dict:
+        """Return a dict representation of the stored data."""
+        return asdict(self)
+
+
+class HildebrandGlowMqttDailyTotalSensor(HildebrandGlowMqttSensor, RestoreEntity):
+    """Daily total derived from a cumulative reading, resetting at the meter's midnight.
+
+    `func` returns the cumulative reading; the state is that reading minus the
+    reading at the start of the day.
+    """
+
+    def __init__(self, **kwargs) -> None:
+        """Initialize the sensor."""
+        super().__init__(**kwargs)
+        self._baseline: float | None = None
+        self._baseline_day: str | None = None
+        self._last_cumulative: float | None = None
+        self._restored = False
+        self._pending_data = None
+
+    async def async_added_to_hass(self) -> None:
+        """Restore the baseline, then process any message received before now."""
+        await super().async_added_to_hass()
+        if (data := await self.async_get_last_extra_data()) is not None:
+            stored = data.as_dict()
+            self._baseline = stored.get("baseline")
+            self._baseline_day = stored.get("baseline_day")
+            self._last_cumulative = stored.get("last_cumulative")
+        self._restored = True
+        if self._pending_data is not None:
+            pending, self._pending_data = self._pending_data, None
+            self.process_update(pending)
+
+    @property
+    def extra_restore_state_data(self) -> DailyTotalStoredData:
+        """Return the baseline data to persist."""
+        return DailyTotalStoredData(
+            self._baseline, self._baseline_day, self._last_cumulative
+        )
+
+    def _meter_zone(self) -> ZoneInfo:
+        """Return the time zone that defines the meter's midnight."""
+        zone = self._time_zone or (
+            self.hass.config.time_zone if self.hass is not None else None
+        )
+        return ZoneInfo(zone or "UTC")
+
+    def process_update(self, mqtt_data) -> None:
+        """Update the daily total from a new cumulative reading."""
+        if not self._restored:
+            # Wait for the stored baseline so a restart doesn't reset today's total
+            self._pending_data = mqtt_data
+            return
+
+        cumulative = self._func(mqtt_data)
+        if cumulative is None:
+            return
+
+        zone = self._meter_zone()
+        message_datetime = self.get_message_datetime(mqtt_data)
+        day = message_datetime.astimezone(zone).date().isoformat()
+
+        if self._baseline is None:
+            # First ever reading: start counting from now
+            self._baseline = cumulative
+            self._baseline_day = day
+        elif day != self._baseline_day:
+            # New day: count from the last reading of the previous day
+            self._baseline = (
+                self._last_cumulative
+                if self._last_cumulative is not None
+                else cumulative
+            )
+            self._baseline_day = day
+
+        if cumulative < self._baseline:
+            if cumulative == 0:
+                _LOGGER.debug("Ignored zero reading on %s.", self._attr_unique_id)
+                return
+            # Meter was reset or replaced
+            self._baseline = cumulative
+
+        self._last_cumulative = cumulative
+        self._attr_native_value = round(cumulative - self._baseline, 3)
+        self._attr_last_reset = self.determine_last_reset(
+            message_datetime, zone, MeterInterval.DAY
+        )
+
+        if self.hass is not None:
+            self.async_schedule_update_ha_state()
