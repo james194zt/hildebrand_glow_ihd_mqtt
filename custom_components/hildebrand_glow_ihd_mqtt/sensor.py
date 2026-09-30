@@ -99,7 +99,7 @@ ELECTRICITY_SENSORS = [
         "device_class": SensorDeviceClass.ENERGY,
         "unit_of_measurement": UnitOfEnergy.KILO_WATT_HOUR,
         "state_class": SensorStateClass.TOTAL_INCREASING,
-        "icon": "mdi:flash",
+        "icon": "mdi:transmission-tower-export",
         "func": lambda js: js["electricitymeter"]["energy"]["export"]["cumulative"],
     },
     {
@@ -108,7 +108,7 @@ ELECTRICITY_SENSORS = [
         "device_class": SensorDeviceClass.ENERGY,
         "unit_of_measurement": UnitOfEnergy.KILO_WATT_HOUR,
         "state_class": SensorStateClass.TOTAL,
-        "icon": "mdi:flash",
+        "icon": "mdi:transmission-tower-export",
         "meter_interval": MeterInterval.DAY,
         "func": lambda js: js["electricitymeter"]["energy"]["export"]["cumulative"],
         "daily_from_cumulative": True,
